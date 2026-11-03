@@ -1,0 +1,833 @@
+// IBMRS6K7248 - the machine bench
+//
+// Runs IBMRS6K7248_system (the CPU, the machine, the clock crossing) from the
+// reset vector on a ROM image, with a plain memory answering the crossing's
+// far side as the SDRAM would (by SDRAM offset, the ROM in the top 4 MB of a
+// 128 MB board). Reports:
+//   - COM1's output (the bytes written to 0x800003F8 with DLAB clear), as text
+//   - every device access in order (--io), and a summary of the stubbed ones
+//     by address, with the PC that made each first
+//   - where the CPU is at the end, and the loop it is in when it stops moving
+//
+// One clock drives both sides of the crossing (both are 100 MHz on the board).
+
+// SDRAM_CHIP (make machine_sd): the board's SDRAM controller in the loop, the
+// memory a behavioural model of the chip (sdram_chip.h), the ROM through the
+// controller's upload port; a snapshot cannot be taken or restored there
+#ifdef SDRAM_CHIP
+#include "VIBMRS6K7248_sdsys.h"
+#include "sdram_chip.h"
+typedef VIBMRS6K7248_sdsys Top;
+#else
+#include "VIBMRS6K7248_system.h"
+typedef VIBMRS6K7248_system Top;
+#endif
+#include "verilated.h"
+#include "verilated_save.h"
+#if VM_TRACE
+#include "verilated_fst_c.h"
+#endif
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <csignal>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#include <map>
+#include <string>
+#include <vector>
+
+static const uint32_t MEM_BYTES = 128u << 20;
+static const uint32_t ROM_AT    = 31;                 // 4 MB units: the top 4 MB of 128
+static std::vector<uint8_t> mem(MEM_BYTES, 0);
+static std::vector<uint64_t> ddr(4u << 17, 0);         // DDR3 from 3000_0000: the S3's VRAM (4 MB reserved)
+static const uint32_t DDR_BASE = 0x06000000;            // in 64-bit words (IBMRS6K7248_s3video)
+
+static uint32_t rd32(uint32_t a) {
+	return (uint32_t(mem[a]) << 24) | (uint32_t(mem[a + 1]) << 16) | (uint32_t(mem[a + 2]) << 8) | mem[a + 3];
+}
+static void wr8(uint32_t a, uint8_t v) { mem[a] = v; }
+
+// the SCSI devices' images, served as hps_io serves its block devices: slot 0 disk ID 0,
+// 1 disk ID 1, 2 the CD-ROM (ID 3). Reads come from the file; writes go to a copy in memory
+// unless --disk-rw (then to the file).
+struct Image {
+	FILE* f = nullptr;
+	uint64_t blocks = 0;
+	bool rw = false;
+	std::map<uint32_t, std::vector<uint8_t>> overlay;    // written blocks (read-only mode)
+	void read(uint32_t lba, uint8_t* p) {
+		auto it = overlay.find(lba);
+		if (it != overlay.end()) { memcpy(p, it->second.data(), 512); return; }
+		memset(p, 0, 512);
+		if (f && lba < blocks && fseeko(f, off_t(lba) * 512, SEEK_SET) == 0) {
+			size_t n = fread(p, 1, 512, f);
+			(void)n;
+		}
+	}
+	void write(uint32_t lba, const uint8_t* p) {
+		if (rw && f) { if (fseeko(f, off_t(lba) * 512, SEEK_SET) == 0) fwrite(p, 1, 512, f); }
+		else overlay[lba].assign(p, p + 512);
+	}
+};
+static Image images[3];
+
+struct StubInfo { uint64_t reads = 0, writes = 0; uint32_t first_pc = 0; uint32_t last_wdata = 0; uint32_t last_rdata = 0; };
+
+static void usage() {
+	printf("machine_tb --rom FILE [--ram MB] [--cycles N] [--instr N] [--io] [--pcs N] [--stall N]\n"
+	       "  --rom FILE   the ROM image (512 KB: the flash at FFF00000, FFF80000 empty)\n"
+	       "  --ram MB     installed RAM, as SIMM pairs: 8 16 24 32 48 56 64 96 112 (default 32)\n"
+	       "  --planar ID  the planar ID at port 0852 (default 0xF5, a 7248-100; F0-F3 a Power Series 830/850)\n"
+	       "  --watch PC   report when PC (hex) first retires (FFF10100 and 8398, main_control, always)\n"
+	       "  --beat N     every N clocks, a line with the instructions retired, the PC and the last progress code (default 20,000,000; 0 none)\n"
+	       "  --save FILE  snapshot the machine when --save-pc PC (hex; default 8398, main_control) first retires\n"
+	       "               (--save-clock N: at the first retire from clock N on instead)\n"
+	       "  --restore FILE  start from a snapshot (the same build and ROM; the options given apply from there)\n"
+	       "  --vram FILE  the S3's 2 MB VRAM at the end, raw (tools/vram.py draws it)\n"
+	       "  --frame FILE the picture's latest whole frame, as a PPM, rewritten at each vertical sync\n"
+	       "  --com1 FILE  COM1's bytes as sent, raw (tools/vt.py FILE draws the terminal's screen)\n"
+	       "  --disk0 FILE, --disk1 FILE, --cd FILE  SCSI images: disks at IDs 0 and 1, the CD-ROM at 3 (writes kept in memory)\n"
+	       "  --disk-rw    the disks' writes go to their files\n"
+	       "  --floppy FILE  a diskette image in drive A: (720 KB to 2.88 MB; writes kept in memory)\n"
+	       "  --fst FILE   write a waveform (needs a make TRACE=1 build) of clocks --from N --to M\n"
+	       "  --lat N      the bench memory answers N clocks after a request (default 6, about the SDRAM's)\n"
+	       "  --cycles N   stop after N clocks (default 50,000,000)\n"
+	       "  --instr N    stop after N instructions retired\n"
+	       "  --io         print every device access as it happens\n"
+	       "  --io-range LO:HI  print the device accesses with addresses LO-HI (hex) only\n"
+	       "  --quiet-progress  do not print the firmware's progress codes (port 680) as they come\n"
+	       "  --pcs N      print the retired PCs up to instruction N (--pcs-from M: from M; absolute, as --beat counts)\n"
+	       "  --calls N    print the calls (C target caller instr: the retire after a branch with LK) and returns (R pc)\n"
+	       "               up to instruction N (--calls-from M: from M)\n"
+	       "  --daddr N    print the data accesses (D R/W physical address, pc, instr) up to instruction N (--daddr-from M: from M)\n"
+	       "  --exc N      print the first N exceptions (X vector from PC instr msr; --exc-from M: from instruction M)\n"
+	       "  --key-at CLOCK:CODE[:e]  press a PS/2 key (set 2 code, hex; e: extended) at that clock, release it 300,000 later; repeatable\n"
+	       "  --keys FIFO  type while it runs: each line written to FIFO (mkfifo; e.g. echo 'dir a:' > FIFO) is typed and\n"
+	       "               Enter pressed; a line that is a key's name (F1-F12 ESC ENTER BKSP TAB UP DOWN LEFT RIGHT) or #CODE\n"
+	       "               (set 2, hex; #eCODE extended) presses that key alone. With --frame FILE to watch the screen\n"
+	       "  --cpu-mhz A --mem-mhz B  the two clocks at their own rates, as on the board (70 and 100); default both one clock\n"
+	       "  --com1-at CLOCK:BYTE     a byte (hex) into COM1 at that clock, at the bench's line rate (16 clocks a bit); repeatable\n"
+	       "  --stall N    stop when no new PC was retired in the last N instructions (default 2,000,000; 0 never)\n");
+}
+
+// SIGINT/SIGTERM end the run at the next clock, with the end's outputs (the VRAM, the stubs)
+static volatile sig_atomic_t stop_req = 0;
+static void on_stop(int) { stop_req = 1; }
+
+int main(int argc, char** argv) {
+	setvbuf(stdout, nullptr, _IOLBF, 0);          // a run cut short still shows how far it got
+	Verilated::commandArgs(argc, argv);
+	const char* rom_path = nullptr;
+	unsigned ram_mb = 32;
+	unsigned planar_id = 0xF5;                         // a 7248-100
+	std::vector<uint32_t> extra_watch;
+	// the SIMM pairs for each size (3 bits a pair, pair 0 lowest: 1 8 MB, 2 16, 3 32, 4 64)
+	static const struct { unsigned mb, cfg; } simm_sets[] = {
+		{8, 1}, {16, 2}, {24, 2 | 1 << 3}, {32, 3}, {48, 3 | 2 << 3}, {56, 3 | 2 << 3 | 1 << 6},
+		{64, 4}, {96, 4 | 3 << 3}, {112, 4 | 3 << 3 | 2 << 6}};
+	uint64_t max_cycles = 50000000, max_instr = 0, stall_lim = 2000000;
+	bool io_print = false, post_print = true;
+	std::string fd_path;                               // --floppy
+	uint32_t io_lo = 0, io_hi = 0xFFFFFFFF;            // --io's range
+	uint64_t daddr_print = 0, daddr_from = 0;          // --daddr: the data addresses (physical) up to an instruction
+	uint64_t pcs_print = 0, pcs_from = 0, calls_print = 0, calls_from = 0;
+	uint32_t prev_insn = 0, prev_pc = 0;
+	uint64_t exc_left = 0, exc_from = 0;
+	uint64_t hang_lim = 0, last_retire = 0;            // --hang N: stop when nothing retires for N clocks
+	const char* memdump_path = nullptr;                // --memdump FILE: the RAM (up to the bench's 128 MB) at the end
+	struct Ring { uint32_t pc, insn, msr; uint64_t cycle; };
+	std::vector<Ring> ring(512);                       // the last 512 instructions retired, printed at the end
+	size_t ring_n = 0;
+	unsigned cpu_mhz = 0, mem_mhz = 0;               // 0: the two clocks as one
+	struct KeyAt { uint64_t clock; unsigned code; bool ext; uint64_t hold = 300000; };
+	std::vector<KeyAt> keys;                      // --key-at
+	struct ByteAt { uint64_t clock; unsigned byte; };
+	std::vector<ByteAt> com1_in;                  // --com1-at
+	uint64_t beat = 20000000;
+	int lat = 6;                                   // the bench memory's answer, in clocks after the request
+	const char* save_path = nullptr;               // a snapshot of the machine (model and memory) ...
+	uint32_t save_pc = 0x00008398;                 // ... when this PC first retires (default main_control)
+	uint64_t save_clock = 0;                       // ... or at the first retire from this clock on (0: by PC)
+	const char* restore_path = nullptr;            // start from a snapshot instead of from reset
+	bool save_exit = false;                        // --save-exit: stop a million clocks after the snapshot
+	const char* vram_path = nullptr;               // the S3's VRAM at the end, raw
+	const char* frame_path = nullptr;              // the latest whole frame of the picture (PPM)
+	const char* keys_path = nullptr;               // --keys: a FIFO read while running, its lines typed
+	const char* com1_path = nullptr;               // COM1's bytes as sent (tools/vt.py draws the screen)
+	const char* img_path[3] = {nullptr, nullptr, nullptr};   // the SCSI images
+	bool disk_rw = false;
+	const char* fst_path = nullptr;                // a waveform (a TRACE=1 build) ...
+	uint64_t fst_from = 0, fst_to = ~0ull;         // ... of these clocks                      // a heartbeat line every so many clocks (0 none)
+	for (int i = 1; i < argc; i++) {
+		std::string a = argv[i];
+		auto next = [&]() { if (i + 1 >= argc) { usage(); exit(2); } return argv[++i]; };
+		if (a == "--rom") rom_path = next();
+		else if (a == "--ram") ram_mb = strtoul(next(), nullptr, 0);
+		else if (a == "--planar") planar_id = strtoul(next(), nullptr, 0);
+		else if (a == "--watch") extra_watch.push_back(strtoul(next(), nullptr, 16));
+		else if (a == "--cycles") max_cycles = strtoull(next(), nullptr, 0);
+		else if (a == "--instr") max_instr = strtoull(next(), nullptr, 0);
+		else if (a == "--io") io_print = true;
+		else if (a == "--io-range") {
+			std::string r = next();
+			size_t c = r.find(':');
+			io_lo = strtoul(r.substr(0, c).c_str(), nullptr, 16);
+			io_hi = c == std::string::npos ? io_lo : strtoul(r.substr(c + 1).c_str(), nullptr, 16);
+			io_print = true;
+		}
+		else if (a == "--quiet-progress") post_print = false;
+		else if (a == "--com1") com1_path = next();
+		else if (a == "--vram") vram_path = next();
+		else if (a == "--frame") frame_path = next();
+		else if (a == "--keys") keys_path = next();
+		else if (a == "--save") save_path = next();
+		else if (a == "--save-pc") save_pc = strtoul(next(), nullptr, 16);
+		else if (a == "--save-clock") save_clock = strtoull(next(), nullptr, 0);
+		else if (a == "--restore") restore_path = next();
+		else if (a == "--save-exit") save_exit = true;
+		else if (a == "--disk0" || a == "--disk1" || a == "--cd") {
+			int n = a == "--disk0" ? 0 : a == "--disk1" ? 1 : 2;
+			img_path[n] = next();
+		}
+		else if (a == "--disk-rw") disk_rw = true;
+		else if (a == "--floppy") fd_path = next();
+		else if (a == "--fst") fst_path = next();
+		else if (a == "--from") fst_from = strtoull(next(), nullptr, 0);
+		else if (a == "--to") fst_to = strtoull(next(), nullptr, 0);
+		else if (a == "--lat") lat = atoi(next());
+		else if (a == "--beat") beat = strtoull(next(), nullptr, 0);
+		else if (a == "--pcs") pcs_print = strtoull(next(), nullptr, 0);
+		else if (a == "--pcs-from") pcs_from = strtoull(next(), nullptr, 0);
+		else if (a == "--calls") calls_print = strtoull(next(), nullptr, 0);
+		else if (a == "--calls-from") calls_from = strtoull(next(), nullptr, 0);
+		else if (a == "--exc") exc_left = strtoull(next(), nullptr, 0);
+		else if (a == "--daddr") daddr_print = strtoull(next(), nullptr, 0);
+		else if (a == "--daddr-from") daddr_from = strtoull(next(), nullptr, 0);
+		else if (a == "--exc-from") exc_from = strtoull(next(), nullptr, 0);
+		else if (a == "--cpu-mhz") cpu_mhz = unsigned(strtoul(next(), nullptr, 0));
+		else if (a == "--mem-mhz") mem_mhz = unsigned(strtoul(next(), nullptr, 0));
+		else if (a == "--key-at") {
+			std::string v = next();
+			size_t c = v.find(':');
+			if (c == std::string::npos) { fprintf(stderr, "--key-at CLOCK:CODE[:e]\n"); return 2; }
+			keys.push_back({strtoull(v.substr(0, c).c_str(), nullptr, 0), unsigned(strtoul(v.substr(c + 1).c_str(), nullptr, 16)), v.find(":e") != std::string::npos});
+		}
+		else if (a == "--com1-at") {
+			std::string v = next();
+			size_t c = v.find(':');
+			if (c == std::string::npos) { fprintf(stderr, "--com1-at CLOCK:BYTE\n"); return 2; }
+			com1_in.push_back({strtoull(v.substr(0, c).c_str(), nullptr, 0), unsigned(strtoul(v.substr(c + 1).c_str(), nullptr, 16))});
+		}
+		else if (a == "--stall") stall_lim = strtoull(next(), nullptr, 0);
+		else if (a == "--hang") hang_lim = strtoull(next(), nullptr, 0);
+		else if (a == "--memdump") memdump_path = next();
+		else { usage(); return 2; }
+	}
+	if (!rom_path) { usage(); return 2; }
+	FILE* f = fopen(rom_path, "rb");
+	if (!f) { perror(rom_path); return 1; }
+	std::vector<uint8_t> rom(4u << 20);
+	size_t rom_len = fread(rom.data(), 1, rom.size(), f);
+	fclose(f);
+	if (rom_len != 512u * 1024 && rom_len != 1024u * 1024) {
+		fprintf(stderr, "ROM is %zu bytes; expected 512 KB or 1 MB\n", rom_len);
+		return 1;
+	}
+	memcpy(&mem[ROM_AT << 22], rom.data(), rom_len);
+	printf("ROM %s, %zu KB; RAM %u MB; reset vector word %08X\n", rom_path, rom_len >> 10, ram_mb,
+	       rd32((ROM_AT << 22) + 0x100));
+
+	FILE* com1_raw = com1_path ? fopen(com1_path, "wb") : nullptr;
+	auto* top = new Top;
+	top->reset_pc = 0xFFF00100;
+	unsigned simm_cfg = ~0u;
+	for (auto& e : simm_sets) if (e.mb == ram_mb) simm_cfg = e.cfg;
+	if (simm_cfg == ~0u) { fprintf(stderr, "--ram %u: not a SIMM size this bench builds\n", ram_mb); return 2; }
+	top->simm_cfg = simm_cfg;
+	top->planar_id = planar_id;
+	top->ps2_key = 0;
+	top->ps2_mouse = 0;
+	top->rtc_set = 0;
+	// the RTC starts at 2026-10-17 12:00:00, a Saturday (hps_io's RTC: BCD seconds, minutes, hours, date, month, year; weekday 0-6 from Sunday)
+	top->rtc_time = (0x00ull) | (0x00ull << 8) | (0x12ull << 16) | (0x17ull << 24) | (0x10ull << 32) | (0x26ull << 40) | (0x06ull << 48);
+	top->rom_at   = ROM_AT;
+	top->rom_512k = rom_len == 512u * 1024;
+	top->com1_rxd = 1;
+	top->com1_cts_n = 0;
+#ifndef SDRAM_CHIP
+	top->b_ack = 0;
+#endif
+	// the SCSI images
+	for (int n = 0; n < 3; n++) {
+		top->img_blocks[n] = 0;
+		if (!img_path[n]) continue;
+		Image& im = images[n];
+		im.rw = disk_rw && n < 2;
+		im.f = fopen(img_path[n], im.rw ? "r+b" : "rb");
+		if (!im.f) { fprintf(stderr, "cannot open %s\n", img_path[n]); return 1; }
+		fseeko(im.f, 0, SEEK_END);
+		im.blocks = uint64_t(ftello(im.f)) / 512;
+		top->img_blocks[n] = uint32_t(im.blocks);
+		printf("SCSI %s %s: %llu blocks\n", n == 2 ? "CD-ROM ID 3" : n == 1 ? "disk ID 1" : "disk ID 0", img_path[n],
+		       (unsigned long long)im.blocks);
+	}
+	top->img_present = (images[0].f ? 1 : 0) | (images[1].f ? 2 : 0) | (images[2].f ? 4 : 0);
+	top->cd_change = 0;
+	top->sd_ack = 0;
+	top->sd_buff_wr = 0;
+	top->reset = 1;
+#ifdef SDRAM_CHIP
+	top->init = 1;
+	top->up_wr = 0;
+	top->dq_in = 0;
+	sdram_chip::Chip chip(10.0);                           // the memory clock's 10 ns
+	long sd_clocks = 0;
+#else
+	top->reset_b = 1;
+#endif
+
+	// the memory: a request is answered LAT clocks after it is seen
+	// (--lat: its latency changes how long the machine waits, not what it does)
+	int  mem_wait = -1;
+	uint32_t rd_addr = 0, rd_left = 0; int rd_wait = 0;     // DDR3: the read burst being answered
+	std::vector<uint8_t> frame(1600 * 1200 * 3, 0);        // the picture
+	uint32_t fx = 0, fy = 0, fw = 0, fh = 0; uint64_t frames = 0;
+	bool was_de = false, was_vs = false;
+	bool ack_now = false;
+
+	std::map<uint32_t, StubInfo> stubs;
+	uint64_t instr = 0, cycle = 0, since_new = 0;
+	uint32_t last_pc = 0;
+	std::map<uint32_t, uint64_t> seen_pc;              // for the stall test: PCs retired lately
+	uint32_t lcr = 0;
+	std::string line;
+	uint64_t io_count = 0;
+	struct Watch { uint32_t pc; std::string name; bool hit; };
+	std::vector<Watch> watch = {
+		{0xFFF10100, "the main block's reset vector", false},
+		{0x00008398, "main_control", false},
+	};
+	for (auto& w : extra_watch) watch.push_back({w, "--watch", false});
+	unsigned post_last = 0;
+	uint64_t post_count = 0;
+
+#if VM_TRACE
+	VerilatedFstC* tfp = nullptr;
+	if (fst_path) {
+		Verilated::traceEverOn(true);
+		tfp = new VerilatedFstC;
+		top->trace(tfp, 99);
+		tfp->open(fst_path);
+	}
+#else
+	if (fst_path) { fprintf(stderr, "--fst needs a make TRACE=1 build\n"); return 2; }
+#endif
+	uint64_t tcycle = 0;
+	// --cpu-mhz/--mem-mhz: the memory clock's edges happen at their own times between the CPU
+	// clock's (half periods in picoseconds); a cycle is still one CPU clock
+	const bool two_clocks = cpu_mhz && mem_mhz && cpu_mhz != mem_mhz;
+	const uint64_t ha = two_clocks ? 500000ull / cpu_mhz : 0, hb = two_clocks ? 500000ull / mem_mhz : 0;
+	uint64_t ta = 0, tb = 0;                                // the time of the next edge of each
+	auto mem_edges_until = [&](uint64_t t) {                // the memory clock's edges up to time t
+		while (tb <= t) {
+			top->clk_b = !top->clk_b;
+			top->eval();
+#ifdef SDRAM_CHIP
+			if (!top->clk_b) {                                // the SDRAM's rising edge
+				bool drv; uint16_t dq;
+				chip.edge(sd_clocks++, top->SDRAM_nCS, top->SDRAM_nRAS, top->SDRAM_nCAS, top->SDRAM_nWE, top->SDRAM_BA,
+				          top->SDRAM_A, (top->SDRAM_A >> 11) & 3 /* the board: DQMH, DQML on A12, A11 */, top->dq_oe, top->dq_out, drv, dq);
+				top->dq_in = dq;
+				top->eval();
+			}
+#endif
+			tb += hb;
+		}
+	};
+	auto tick = [&]() {
+		if (two_clocks) {
+			ta += ha; mem_edges_until(ta); top->clk = 0; top->eval();
+			ta += ha; mem_edges_until(ta); top->clk = 1; top->eval();
+			tcycle++;
+			return;
+		}
+		top->clk = 0; top->clk_b = 0; top->eval();
+#ifdef SDRAM_CHIP
+		{	// the SDRAM's rising edge (its clock is the controller's inverted)
+			bool drv; uint16_t dq;
+			chip.edge(sd_clocks++, top->SDRAM_nCS, top->SDRAM_nRAS, top->SDRAM_nCAS, top->SDRAM_nWE, top->SDRAM_BA,
+			          top->SDRAM_A, (top->SDRAM_A >> 11) & 3 /* the board: DQMH, DQML on A12, A11 */, top->dq_oe, top->dq_out, drv, dq);
+			top->dq_in = dq;
+			top->eval();
+		}
+#endif
+#if VM_TRACE
+		if (tfp && tcycle >= fst_from && tcycle <= fst_to) tfp->dump(2 * tcycle);
+#endif
+		top->clk = 1; top->clk_b = 1; top->eval();
+#if VM_TRACE
+		if (tfp && tcycle >= fst_from && tcycle <= fst_to) tfp->dump(2 * tcycle + 1);
+#endif
+		tcycle++;
+	};
+
+	// the bench's own state that a snapshot carries beside the model's
+	auto snap = [&](auto& f) {
+		f(&cycle, sizeof cycle); f(&instr, sizeof instr); f(&last_pc, sizeof last_pc); f(&lcr, sizeof lcr);
+		f(&post_last, sizeof post_last); f(&post_count, sizeof post_count); f(&io_count, sizeof io_count);
+		f(&mem_wait, sizeof mem_wait); f(&ack_now, sizeof ack_now); f(&tcycle, sizeof tcycle);
+		f(mem.data(), mem.size());
+		f(ddr.data(), ddr.size() * 8);
+	};
+	uint64_t cycle0 = 0;
+	if (restore_path) {
+		VerilatedRestore is;
+		is.open(restore_path);
+		if (!is.isOpen()) { perror(restore_path); return 1; }
+		is >> *top;
+		auto rd = [&](void* p, size_t n) { is.read(p, n); };
+		snap(rd);
+		is.close();
+		cycle0 = cycle + 1;
+		// the restore brought the snapshot's inputs back: this run's images, not those (a
+		// snapshot made without a CD gave every ID a selection timeout, 2026-10-17)
+		top->img_present = (images[0].f ? 1 : 0) | (images[1].f ? 2 : 0) | (images[2].f ? 4 : 0);
+		for (int n = 0; n < 3; n++) top->img_blocks[n] = uint32_t(images[n].blocks);
+		top->rom_at = ROM_AT;
+		top->rom_512k = rom_len == 512u * 1024;
+		printf("  images present %d\n", top->img_present);
+		printf("restored %s: clock %llu, %llu instructions, pc %08X\n", restore_path,
+		       (unsigned long long)cycle, (unsigned long long)instr, last_pc);
+	}
+	else {
+		top->rtc_set = 1;
+		for (int i = 0; i < 20; i++) tick();
+		top->rtc_set = 0;
+#ifdef SDRAM_CHIP
+		// the controller's power-up, then the ROM in through the upload port, as on the board
+		for (int i = 0; i < 4; i++) tick();
+		top->init = 0;
+		for (int i = 0; i < 20000000 && !top->ready; i++) tick();
+		if (!top->ready) { fprintf(stderr, "the SDRAM controller never became ready\n"); return 1; }
+		for (size_t i = 0; i < rom_len; i++) {
+			while (top->up_busy) tick();
+			top->up_wr = 1; top->up_addr = (ROM_AT << 22) + uint32_t(i); top->up_data = rom[i];
+			tick();
+			top->up_wr = 0;
+			tick();
+		}
+		for (int i = 0; i < 200; i++) tick();
+		printf("SDRAM model: ready after %ld clocks, the ROM uploaded (%d protocol errors so far)\n", sd_clocks, sdram_chip::errors);
+		top->reset = 0;
+#else
+		top->reset = 0;
+		top->reset_b = 0;
+#endif
+	}
+	bool saved = false;
+
+	const char* why = "cycle limit";
+	signal(SIGINT, on_stop);
+	signal(SIGTERM, on_stop);
+	// the block device being served: hps_io's protocol, a byte a clock
+	int sd_n = -1;                                  // the slot, -1 none
+	bool sd_w = false;
+	uint32_t sd_pos = 0, sd_len = 0, sd_lba0 = 0;
+	std::vector<uint8_t> sd_buf;
+	uint64_t sd_reads = 0, sd_writes = 0;
+	unsigned ps2_toggle = 0;
+	// the floppy image (--floppy), on the controller's sector port (IBMRS6K7248_fdimg's other side): a sector
+	// asked by toggling fd_req (fd_we, fd_lba), answered by toggling fd_ack; the 512-byte buffers by fd_buf_a
+	// (a read's byte a clock after its address, a write's byte with fd_buf_we)
+	std::vector<uint8_t> fd_img;
+	if (!fd_path.empty()) {
+		FILE* f = fopen(fd_path.c_str(), "rb");
+		if (!f) { fprintf(stderr, "cannot open %s\n", fd_path.c_str()); return 1; }
+		fseek(f, 0, SEEK_END); fd_img.resize(ftell(f)); fseek(f, 0, SEEK_SET);
+		if (fread(fd_img.data(), 1, fd_img.size(), f) != fd_img.size()) { fprintf(stderr, "short read: %s\n", fd_path.c_str()); return 1; }
+		fclose(f);
+		printf("  floppy: %s, %zu bytes\n", fd_path.c_str(), fd_img.size());
+	}
+	uint8_t fd_rbuf[512] = {0}, fd_wbuf[512] = {0};
+	unsigned fd_prev_a = 0, fd_req_seen = 0, fd_lba = 0;
+	bool fd_mount_done = false, fd_wr = false;
+	uint64_t fd_due = 0, fd_ops = 0;
+	// --keys: the FIFO opened read-write (no writer needed, never at EOF), read without blocking
+	int keys_fd = -1;
+	std::string keys_line;
+	uint64_t keys_next = 0;                         // the clock the next typed key may go at
+	if (keys_path) {
+		keys_fd = open(keys_path, O_RDWR | O_NONBLOCK);
+		if (keys_fd < 0) { fprintf(stderr, "cannot open %s (mkfifo it first)\n", keys_path); return 1; }
+		printf("  keys from %s\n", keys_path);
+	}
+	for (cycle = cycle0; cycle < max_cycles; cycle++) {
+		if (stop_req) { why = "a signal"; break; }
+		// --keys: every 1M clocks, the FIFO's whole lines as keys, 600,000 clocks apart (a shifted one with the
+		// left shift held around it)
+		if (keys_fd >= 0 && cycle % 1000000 == 0) {
+			char b[256];
+			ssize_t n;
+			while ((n = read(keys_fd, b, sizeof b)) > 0) keys_line.append(b, size_t(n));
+			size_t nl;
+			while ((nl = keys_line.find('\n')) != std::string::npos) {
+				std::string l = keys_line.substr(0, nl);
+				keys_line.erase(0, nl + 1);
+				while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+				if (keys_next < cycle) keys_next = cycle;
+				auto key = [&](unsigned code, bool ext, bool shift) {
+					if (shift) { keys.push_back({keys_next, 0x12, false, 900000}); keys_next += 300000; }
+					keys.push_back({keys_next, code, ext});
+					keys_next += shift ? 600000 + 300000 : 600000;
+				};
+				static const std::map<std::string, unsigned> names = {
+					{"F1", 0x05}, {"F2", 0x06}, {"F3", 0x04}, {"F4", 0x0C}, {"F5", 0x03}, {"F6", 0x0B}, {"F7", 0x83},
+					{"F8", 0x0A}, {"F9", 0x01}, {"F10", 0x09}, {"F11", 0x78}, {"F12", 0x07}, {"ESC", 0x76},
+					{"ENTER", 0x5A}, {"BKSP", 0x66}, {"TAB", 0x0D}, {"UP", 0x175}, {"DOWN", 0x172}, {"LEFT", 0x16B},
+					{"RIGHT", 0x174}};
+				auto nm = names.find(l);
+				if (nm != names.end()) key(nm->second & 0xFF, nm->second > 0xFF, false);
+				else if (l.size() > 1 && l[0] == '#') {
+					bool ext = l[1] == 'e';
+					key(unsigned(strtoul(l.c_str() + (ext ? 2 : 1), nullptr, 16)), ext, false);
+				}
+				else {
+					// set 2 codes: unshifted, then the shifted characters by the unshifted key
+					static const char* plain = "abcdefghijklmnopqrstuvwxyz1234567890 -=[]\\;',./`";
+					static const unsigned pcode[] = {0x1C, 0x32, 0x21, 0x23, 0x24, 0x2B, 0x34, 0x33, 0x43, 0x3B, 0x42, 0x4B,
+						0x3A, 0x31, 0x44, 0x4D, 0x15, 0x2D, 0x1B, 0x2C, 0x3C, 0x2A, 0x1D, 0x22, 0x35, 0x1A, 0x16, 0x1E,
+						0x26, 0x25, 0x2E, 0x36, 0x3D, 0x3E, 0x46, 0x45, 0x29, 0x4E, 0x55, 0x54, 0x5B, 0x5D, 0x4C, 0x52,
+						0x41, 0x49, 0x4A, 0x0E};
+					static const char* shifted = "!@#$%^&*()_+{}|:\"<>?~";
+					static const char* unshift = "1234567890-=[]\\;',./`";
+					for (char ch : l) {
+						bool sh = false;
+						if (ch >= 'A' && ch <= 'Z') { ch = char(ch - 'A' + 'a'); sh = true; }
+						else if (const char* q = strchr(shifted, ch); q && ch) { ch = unshift[q - shifted]; sh = true; }
+						const char* q = ch ? strchr(plain, ch) : nullptr;
+						if (q) key(pcode[q - plain], false, sh);
+					}
+					key(0x5A, false, false);
+				}
+				printf("  keys: \"%s\" from clock %llu\n", l.c_str(), (unsigned long long)cycle);
+			}
+			// the keys long done
+			keys.erase(std::remove_if(keys.begin(), keys.end(), [&](const KeyAt& k) { return k.clock + k.hold < cycle; }), keys.end());
+		}
+		// --key-at: the make at its clock, the break 300,000 clocks later (hps_io's ps2_key: a toggle, pressed, extended, the code)
+		for (auto& k : keys) {
+			if (cycle == k.clock || cycle == k.clock + k.hold) {
+				ps2_toggle ^= 1;
+				bool make = cycle == k.clock;
+				top->ps2_key = (ps2_toggle << 10) | (make ? 1u << 9 : 0) | (k.ext ? 1u << 8 : 0) | (k.code & 0xFF);
+				printf("  key %02X%s %s at clock %llu\n", k.code, k.ext ? " (extended)" : "", make ? "pressed" : "released", (unsigned long long)cycle);
+			}
+		}
+		// --com1-at: start bit, eight data bits (LSB first), stop bit, 16 clocks each (UART_FAST)
+		for (auto& b : com1_in) {
+			if (cycle >= b.clock && cycle < b.clock + 16 * 10) {
+				unsigned bit = unsigned((cycle - b.clock) / 16);
+				top->com1_rxd = bit == 0 ? 0 : bit == 9 ? 1 : (b.byte >> (bit - 1)) & 1;
+				if (cycle == b.clock) printf("  COM1 in %02X at clock %llu\n", b.byte, (unsigned long long)cycle);
+			} else if (cycle == b.clock + 16 * 10) top->com1_rxd = 1;
+		}
+#ifndef SDRAM_CHIP
+		// the floppy image: mounted at the first clock (a one-clock pulse), then its sectors
+		if (!fd_img.empty()) {
+			top->fd_mounted = 0;
+			if (!fd_mount_done) {
+				top->fd_in = 1; top->fd_ro = 0; top->fd_blocks = unsigned(fd_img.size() / 512);
+				top->fd_mounted = 1; fd_mount_done = true;
+				fd_req_seen = top->fd_req;
+			}
+			top->fd_buf_q = fd_rbuf[fd_prev_a & 511];
+			fd_prev_a = top->fd_buf_a;
+			if (top->fd_buf_we) fd_wbuf[top->fd_buf_a & 511] = top->fd_buf_d;
+			if (top->fd_req != fd_req_seen) {
+				fd_req_seen = top->fd_req; fd_wr = top->fd_we; fd_lba = top->fd_lba; fd_due = cycle + 400;
+				if (fd_ops++ < 4000)
+					printf("  floppy %s sector %u  (clock %llu, instr %llu)\n", fd_wr ? "write" : "read", fd_lba,
+					       (unsigned long long)cycle, (unsigned long long)instr);
+			}
+			if (fd_due && cycle >= fd_due) {
+				size_t o = size_t(fd_lba) * 512;
+				if (!fd_wr) { for (int i = 0; i < 512; i++) fd_rbuf[i] = o + i < fd_img.size() ? fd_img[o + i] : 0; }
+				else        { for (int i = 0; i < 512; i++) if (o + i < fd_img.size()) fd_img[o + i] = fd_wbuf[i]; }
+				top->fd_ack ^= 1; fd_due = 0;
+			}
+		}
+#endif
+		// hps_io's side of the SCSI images
+		top->sd_buff_wr = 0;
+		if (sd_n < 0) {
+			for (int n = 0; n < 3; n++)
+				if (((top->sd_rd | top->sd_wr) >> n) & 1) {
+					sd_n = n; sd_w = (top->sd_wr >> n) & 1;
+					sd_lba0 = top->sd_lba[n];
+					sd_len = (uint32_t(top->sd_blk_cnt[n]) + 1) * 512;
+					sd_pos = 0;
+					sd_buf.assign(sd_len, 0);
+					if (sd_reads + sd_writes < 2000)
+						printf("  image %d %s block %u x%u  (instr %llu)\n", n, sd_w ? "write" : "read", sd_lba0, sd_len / 512,
+						       (unsigned long long)instr);
+					if (!sd_w) { for (uint32_t b = 0; b < sd_len / 512; b++) images[n].read(sd_lba0 + b, &sd_buf[512 * b]); sd_reads++; }
+					else sd_writes++;
+					top->sd_ack = 1 << n;
+					break;
+				}
+		} else if (!sd_w) {
+			if (sd_pos < sd_len) {
+				top->sd_buff_addr = sd_pos; top->sd_buff_dout = sd_buf[sd_pos]; top->sd_buff_wr = 1; sd_pos++;
+			} else { top->sd_ack = 0; sd_n = -1; }
+		} else {
+			// the core's byte at the address set a clock before (its buffer is registered)
+			if (sd_pos >= 1) sd_buf[sd_pos - 1] = top->sd_buff_din[sd_n];
+			if (sd_pos < sd_len) { top->sd_buff_addr = sd_pos; sd_pos++; }
+			else {
+				for (uint32_t b = 0; b < sd_len / 512; b++) images[sd_n].write(sd_lba0 + b, &sd_buf[512 * b]);
+				top->sd_ack = 0; sd_n = -1;
+			}
+		}
+#ifndef SDRAM_CHIP
+		// the memory side, before the edge: set ack/rdata for this edge
+		if (ack_now) { top->b_ack = 0; ack_now = false; }
+		else if (top->b_req) {
+			if (mem_wait < 0) mem_wait = lat;
+			else if (mem_wait == 0) {
+				uint32_t a = uint32_t(top->b_addr) << 2;
+				if (a >= MEM_BYTES) a &= MEM_BYTES - 1;
+				if (top->b_line) {
+					a &= ~31u;
+					for (int w = 0; w < 8; w++) {
+						if (top->b_we) {
+							uint32_t v = top->b_wdata[7 - w];
+							for (int b = 0; b < 4; b++) wr8(a + 4 * w + b, v >> (24 - 8 * b));
+						} else top->b_rdata[7 - w] = rd32(a + 4 * w);
+					}
+				} else {
+					if (top->b_we) {
+						uint32_t v = top->b_wdata[0];
+						for (int b = 0; b < 4; b++) if (top->b_be & (8 >> b)) wr8(a + b, v >> (24 - 8 * b));
+					} else {
+						for (int w = 0; w < 8; w++) top->b_rdata[w] = 0;
+						top->b_rdata[0] = rd32(a);
+					}
+				}
+				top->b_ack = 1;
+				ack_now = true;
+				mem_wait = -1;
+			} else mem_wait--;
+		}
+#endif
+		// DDR3 (the S3's VRAM): a read burst answered a beat a clock after 4 clocks; writes at once
+		top->ddr_busy = 0;
+		top->ddr_dout_ready = 0;
+		if (rd_left && rd_wait == 0) {
+			uint32_t w = rd_addr - DDR_BASE;
+			top->ddr_dout = (w < ddr.size()) ? ddr[w] : ~0ull;
+			top->ddr_dout_ready = 1;
+			rd_addr++; rd_left--;
+		}
+		else if (rd_left) rd_wait--;
+		tick();
+		if (top->ddr_rd && !rd_left) { rd_addr = top->ddr_addr; rd_left = top->ddr_burstcnt; rd_wait = 4; }
+		if (top->ddr_we) {
+			uint32_t w = uint32_t(top->ddr_addr) - DDR_BASE;
+			if (w < ddr.size())
+				for (int b = 0; b < 8; b++)
+					if (top->ddr_be & (1 << b)) ddr[w] = (ddr[w] & ~(0xFFull << (8 * b))) | (uint64_t(top->ddr_din) & (0xFFull << (8 * b)));
+		}
+		// the picture: the visible pixels into a frame, saved at each vertical sync
+		if (top->vid_ce) {
+			bool de = !top->vid_hblank && !top->vid_vblank;
+			if (de) {
+				if (fy < 1200 && fx < 1600) {
+					uint8_t* px = &frame[(fy * 1600 + fx) * 3];
+					px[0] = top->vid_r; px[1] = top->vid_g; px[2] = top->vid_b;
+				}
+				fx++;
+				if (fx > fw) fw = fx;
+			}
+			else if (was_de) { fx = 0; fy++; if (fy > fh) fh = fy; }
+			was_de = de;
+			if (top->vid_vs && !was_vs) {
+				if (frame_path && fw && fh) {
+					FILE* ff = fopen(frame_path, "wb");
+					if (ff) {
+						// (a mode being set can give a line or a frame larger than the buffer: clipped)
+						if (fw > 1600) fw = 1600;
+						if (fh > 1200) fh = 1200;
+						fprintf(ff, "P6\n%u %u\n255\n", fw, fh);
+						for (uint32_t y = 0; y < fh; y++) fwrite(&frame[y * 1600 * 3], 1, fw * 3, ff);
+						fclose(ff);
+					}
+				}
+				frames++;
+				fx = fy = fw = fh = 0;
+			}
+			was_vs = top->vid_vs;
+		}
+		if (beat && cycle && cycle % beat == 0)
+			printf("  [clock %llu: %llu instructions, pc %08X, progress %02X]\n", (unsigned long long)cycle,
+			       (unsigned long long)instr, last_pc, post_last);
+
+		if (top->trace_valid && top->trace_last) {
+			uint32_t pc = top->trace_pc;
+			if (save_path && !saved && (save_clock ? cycle >= save_clock : pc == save_pc)) {
+				last_pc = pc;
+				instr++;
+				VerilatedSave os;
+				os.open(save_path);
+				os << *top;
+				auto wr = [&](void* p, size_t n) { os.write(p, n); };
+				snap(wr);
+				os.close();
+				instr--;
+				saved = true;
+				printf("  saved %s at pc %08X, clock %llu\n", save_path, pc, (unsigned long long)cycle);
+				if (save_exit) max_cycles = cycle + 1000000;
+			}
+			for (auto& w : watch)
+				if (!w.hit && pc == w.pc) {
+					w.hit = true;
+					printf("  reached %08X (%s) at instr %llu, clock %llu\n", pc, w.name.c_str(),
+					       (unsigned long long)instr, (unsigned long long)cycle);
+				}
+			if (instr < pcs_print && instr >= pcs_from) printf("  pc %08X  %08X  msr %08X\n", pc, top->trace_insn, top->trace_msr);
+			if (instr < calls_print && instr >= calls_from) {
+				// the instruction retired before: b/bc/bclr/bcctr with LK is a call, bclr without it a return
+				uint32_t op = prev_insn >> 26, xo = (prev_insn >> 1) & 0x3FF;
+				bool br = op == 18 || op == 16 || (op == 19 && (xo == 16 || xo == 528));
+				if (br && (prev_insn & 1)) printf("C %08X %08X %llu\n", pc, prev_pc, (unsigned long long)instr);
+				else if (op == 19 && xo == 16 && pc != prev_pc + 4) printf("R %08X\n", pc);
+			}
+			// an exception: a vector (100-F00, at 0 or FFF00000) reached other than by falling into it or a branch
+			if (exc_left && instr >= exc_from && (pc & 0xFFu) == 0 && (pc & 0xFFFFF000u) == (pc >= 0xFFF00000u ? 0xFFF00000u : 0u) &&
+			    (pc & 0xF00u) != 0 && pc != prev_pc + 4) {
+				uint32_t op = prev_insn >> 26;
+				bool br = op == 18 || op == 16 || op == 19;
+				if (!br || (pc & 0xF00u) == 0x300u || (pc & 0xF00u) == 0x400u || (pc & 0xF00u) == 0x700u) {
+					printf("X %03X from %08X  instr %llu  msr %08X\n", pc & 0xFFFu, prev_pc, (unsigned long long)instr, top->trace_msr);
+					exc_left--;
+				}
+			}
+			// the instruction word from the bench's memory (trace_insn is per retire group, not per instruction)
+			if (pc < MEM_BYTES - 4) prev_insn = rd32(pc);
+			else if (pc >= 0xFFF00000u) prev_insn = rd32((ROM_AT << 22) + (pc - 0xFFF00000u));
+			else prev_insn = 0;
+			prev_pc = pc;
+			ring[ring_n++ % ring.size()] = {pc, prev_insn, uint32_t(top->trace_msr), cycle};
+			last_retire = cycle;
+			instr++;
+			last_pc = pc;
+			if (seen_pc.emplace(pc, instr).second) since_new = 0;
+			else since_new++;
+			if (max_instr && instr >= max_instr) { why = "instruction limit"; break; }
+			if (stall_lim && since_new >= stall_lim) { why = "no new code for the stall limit"; break; }
+		}
+		if (hang_lim && instr && cycle - last_retire > hang_lim) { why = "nothing retired for the hang limit"; break; }
+		if (top->trace_dreq && instr < daddr_print && instr >= daddr_from)
+			printf("D %c %08X  (pc %08X, instr %llu)\n", top->trace_dwe ? 'W' : 'R', uint32_t(top->trace_daddr) << 2, last_pc, (unsigned long long)instr);
+		if (top->io_ev) {
+			io_count++;
+			uint32_t a = top->io_addr;
+			uint8_t be = top->io_be;
+			bool we = top->io_we;
+			if (io_print && a >= io_lo && a <= io_hi)
+				printf("  io %s %08X be %X %08X%s  (pc %08X lr %08X instr %llu)\n", we ? "W" : "R", a, be,
+				       we ? uint32_t(top->io_wdata) : uint32_t(top->io_rdata), top->io_stub ? "  stub" : "", last_pc,
+				       uint32_t(top->trace_lr), (unsigned long long)instr);
+			// COM1: the byte written to THR, LCR followed for DLAB
+			if (we && (a & ~3u) == 0x800003F8 && (be & 8) && !(lcr & 0x80)) {
+				char c = char(top->io_wdata >> 24);
+				if (com1_raw) { fputc(c, com1_raw); fflush(com1_raw); }
+				if (c == '\n' || line.size() > 200) { printf("COM1| %s\n", line.c_str()); line.clear(); }
+				else if (c != '\r') line += (c >= 32 && c < 127) ? c : '.';
+			}
+			if (we && (a & ~3u) == 0x800003F8 && (be & 1)) lcr = top->io_wdata & 0xFF;   // 3FB
+			// the firmware's progress codes: every step writes a little-endian word 000x00nn to
+			// 680 (the assembly also writes nn to 8C0, the C code only to 680)
+			if (we && a == 0x80000680 && be == 0xF) {
+				unsigned code = (top->io_wdata >> 24) & 0xFF;
+				uint32_t w = top->io_wdata;
+				uint32_t word = (w >> 24) | ((w >> 8) & 0xFF00) | ((w << 8) & 0xFF0000) | (w << 24);   // little-endian
+				if (post_print) {
+					if (word >> 8) printf("  progress %02X  (pc %08X, instr %llu; word %08X)\n", code, last_pc, (unsigned long long)instr, word);
+					else printf("  progress %02X  (pc %08X, instr %llu)\n", code, last_pc, (unsigned long long)instr);
+				}
+				post_last = code;
+				post_count++;
+			}
+			if (top->io_stub) {
+				// the byte address of the first enabled lane
+				uint32_t ba = a;
+				for (int b = 0; b < 4; b++) if (be & (8 >> b)) { ba = a + b; break; }
+				auto& s = stubs[ba];
+				if (s.reads + s.writes == 0) s.first_pc = last_pc;
+				if (we) { s.writes++; s.last_wdata = top->io_wdata; } else { s.reads++; s.last_rdata = top->io_rdata; }
+			}
+		}
+	}
+	if (!line.empty()) printf("COM1| %s\n", line.c_str());
+
+	printf("\nstopped: %s after %llu clocks, %llu instructions retired (%.2f clocks each), %llu device accesses\n",
+	       why, (unsigned long long)cycle, (unsigned long long)instr, instr ? double(cycle) / instr : 0.0,
+	       (unsigned long long)io_count);
+	printf("last PC %08X; %llu progress codes, the last %02X\n", last_pc, (unsigned long long)post_count, post_last);
+	if (hang_lim || memdump_path) {
+		printf("the last instructions retired (pc, the word in memory, msr, clock):\n");
+		size_t n = ring_n < ring.size() ? ring_n : ring.size();
+		for (size_t i = ring_n - n; i < ring_n; i++) {
+			auto& r = ring[i % ring.size()];
+			printf("  R %08X %08X msr %08X  %llu\n", r.pc, r.insn, r.msr, (unsigned long long)r.cycle);
+		}
+		printf("  CPU now: data request %d, write %d, address %08X\n", int(top->trace_dreq), int(top->trace_dwe),
+		       uint32_t(top->trace_daddr) << 2);
+	}
+	if (memdump_path) {
+		FILE* mf = fopen(memdump_path, "wb");
+		if (mf) {
+			for (uint32_t a = 0; a < (ram_mb << 20) && a < MEM_BYTES; a += 4) {
+				uint32_t w = rd32(a);
+				uint8_t b[4] = {uint8_t(w >> 24), uint8_t(w >> 16), uint8_t(w >> 8), uint8_t(w)};
+				fwrite(b, 1, 4, mf);
+			}
+			fclose(mf);
+			printf("RAM written to %s\n", memdump_path);
+		}
+	}
+	// the loop it is in: the PCs retired in the last stretch, by address
+	if (since_new > 1000) {
+		std::vector<uint32_t> recent;
+		for (auto& [pc, first] : seen_pc) if (instr - first > 0) recent.push_back(pc);
+		printf("(no new PC in the last %llu instructions)\n", (unsigned long long)since_new);
+	}
+#ifdef SDRAM_CHIP
+	printf("SDRAM model: %ld clocks, %d protocol errors; refreshes rank 0 %ld, rank 1 %ld, at most %d owed\n",
+	       sd_clocks, sdram_chip::errors, chip.rk[0].refreshes, chip.rk[1].refreshes, chip.max_owed);
+#endif
+	printf("\nstubbed device addresses (%zu):\n", stubs.size());
+	printf("  %-10s %10s %10s  %-8s  %-8s  %s\n", "address", "reads", "writes", "last w", "read", "first PC");
+	for (auto& [a, s] : stubs)
+		printf("  %08X   %10llu %10llu  %08X  %08X  %08X\n", a, (unsigned long long)s.reads,
+		       (unsigned long long)s.writes, s.last_wdata, s.last_rdata, s.first_pc);
+	if (vram_path) {
+		FILE* vf = fopen(vram_path, "wb");
+		if (vf) {
+			// in VRAM's byte order: byte a in DDR3 word a >> 3, lane a & 7
+			for (uint32_t a = 0; a < (2u << 20); a++) fputc(int(ddr[a >> 3] >> (8 * (a & 7))) & 0xFF, vf);
+			fclose(vf);
+		}
+	}
+	printf("%llu frames of the picture\n", (unsigned long long)frames);
+	if (sd_reads || sd_writes) printf("SCSI images: %llu reads, %llu writes\n", (unsigned long long)sd_reads, (unsigned long long)sd_writes);
+#if VM_TRACE
+	if (tfp) tfp->close();
+#endif
+	delete top;
+	return 0;
+}
