@@ -92,7 +92,10 @@ module IBMRS6K7248_pcnet
 	input  logic [5:0]  m_rx_hash,
 	input  logic [47:0] aprom_mac,              // (quasi-static) the first byte in 47:40
 	output logic [47:0] padr,                   // ... the driver's, the first byte in 47:40
-	output logic        padr_ok
+	output logic        padr_ok,
+
+	// the state for the network probe (IBMRS6K7248_NETPROBE: IBMRS6K7248_enetbox); clk, read as it stands
+	output logic [95:0] dbg
 );
 
 // ---- PCI configuration ----------------------------------------------------------------------
@@ -294,7 +297,7 @@ typedef enum logic [4:0] {
 	E_IDLE, E_DMA, E_INIT, E_INIT_N,
 	E_TX, E_TXD, E_TXD_N, E_TXOWN, E_TXB, E_TXCP, E_TXSTAT, E_TXNEXT,
 	E_RX, E_RXF, E_RXF_N, E_RXFILT, E_RXD, E_RXD_N, E_RXOWN, E_RXCP, E_RXCP_W, E_RXCP_D,
-	E_RXBUF, E_RXMORE, E_RXLAST, E_RXSTAT, E_RXDONE, E_RXOVF, E_RXDROP
+	E_RXBUF, E_RXMORE, E_RXLAST, E_RXSTAT, E_RXDONE, E_RXOVF, E_RXDROP, E_RXCHK, E_RXCHK_N
 } est_t;
 est_t        e, e_ret;                                 // (E_DMA returns to e_ret)
 
@@ -331,6 +334,8 @@ wire [11:0] d_bcnt   = dw1[11:0];                       // two's complement: the
 wire [12:0] d_blen   = d_bcnt == 12'd0 ? 13'd4096 : 13'(13'h1000 - {1'b0, d_bcnt});
 wire        d_own    = d_status[15];
 wire [2:0]  d_last   = swstyle == 8'd0 ? 3'd1 : 3'd2;   // a descriptor's last word read
+logic [3:0] c_lost = 4'd0;                              // the network probe: OWN found set right after clearing it
+wire        chk_own  = da[2] ? drd[7] : drd[39];       // ... OWN, the top bit of the word read
 
 // the frame being gathered or scattered
 logic [10:0] f_len;                                    // its length (receive: with the FCS)
@@ -524,6 +529,10 @@ always_ff @(posedge clk) begin
 			end
 			else if (strt_req) begin
 				strt_req <= 1'b0;
+				// after STOP the rings start again from their first descriptors, with or without INIT: NT's
+				// amdpcn.sys rebuilds them, zeroes its own indices and sets STRT alone
+				rx_idx   <= 9'd0;
+				tx_idx   <= 9'd0;
 				if (!dtx) csr0[4] <= 1'b1;                     // TXON
 				if (!drx) csr0[5] <= 1'b1;                     // RXON
 				csr0[1] <= 1'b1;
@@ -754,7 +763,8 @@ always_ff @(posedge clk) begin
 		end
 		// the frame's bytes into the buffer: a doubleword filled a byte at a time, then written
 		E_RXCP: begin
-			if (b_left == 13'd0 || f_pos == f_len) e <= E_RXBUF;
+			if (stop_b) e <= E_RXDROP;                          // STOP: the frame goes, its descriptor stays the driver's to rebuild
+			else if (b_left == 13'd0 || f_pos == f_len) e <= E_RXBUF;
 			else begin rd_a <= f_pos; e <= E_RXCP_W; end
 		end
 		E_RXCP_W: e <= E_RXCP_D;                               // (the buffer takes the address)
@@ -803,7 +813,11 @@ always_ff @(posedge clk) begin
 			end
 		end
 		E_RXSTAT: begin
+`ifdef IBMRS6K7248_NETPROBE
+			dwe <= 1'b1; e_ret <= E_RXCHK; e <= E_DMA;
+`else
 			dwe <= 1'b1; e_ret <= E_RXDONE; e <= E_DMA;
+`endif
 			if (swstyle == 8'd0) begin
 				da <= desc_a + 32'd3; dbe <= be8(desc_a + 32'd3); dwd <= {8{6'd0, first_d, 1'b1}};
 			end
@@ -812,6 +826,16 @@ always_ff @(posedge clk) begin
 				dwd <= {4{1'b0, is_pa, is_la, is_bc, 4'h0, 6'd0, first_d, 1'b1}};
 			end
 		end
+`ifdef IBMRS6K7248_NETPROBE
+		// the probe reads the status word back: OWN still set means the write above was undone
+		E_RXCHK: begin
+			da <= swstyle == 8'd0 ? desc_a : desc_a + 32'd4; dwe <= 1'b0; dbe <= 8'hFF; e_ret <= E_RXCHK_N; e <= E_DMA;
+		end
+		E_RXCHK_N: begin
+			if (chk_own) c_lost <= c_lost + 4'd1;
+			e <= E_RXDONE;
+		end
+`endif
 		E_RXDONE: begin
 			prev_a     <= desc_a;
 			prev_first <= first_d;
@@ -872,5 +896,16 @@ always_ff @(posedge clk) begin
 		rx_take_t <= rx_post_s[2];
 	end
 end
+
+// ---- the network probe's words (nothing reads them unless IBMRS6K7248_NETPROBE): what is here already, and
+// the interrupts counted
+logic [15:0] c_irq = 16'd0;
+logic        irq_q = 1'b0;
+always_ff @(posedge clk) begin
+	irq_q <= irq;
+	if (irq && !irq_q) c_irq <= c_irq + 16'd1;
+end
+assign dbg = {c_lost, c_irq[11:0], csr112,
+              {|csr0[14:11], csr0[14:8], intr, csr0[6:0]}, csr3, rx_idx, tx_idx, 5'(e), tx_busy, rx_ready, poll_due, irq, rap[4:0]};
 
 endmodule

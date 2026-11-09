@@ -284,6 +284,7 @@ module IBMRS6K7248_machine
 	input  logic [47:0]  en_aprom_mac,
 	output logic [47:0]  en_padr,
 	output logic         en_padr_ok,
+	output logic [159:0] en_dbg,                  // the network probe's words (IBMRS6K7248_NETPROBE)
 
 	// every device access as it is answered (for the test bench)
 	output logic         io_ev,
@@ -492,6 +493,22 @@ always_ff @(posedge clk) begin
 		dm_ack    <= 1'b0;
 		dq_w1     <= 1'b0;
 	end
+end
+
+// The network probe's (nothing reads them unless IBMRS6K7248_NETPROBE): against a DMA write's line, a CPU
+// line read granted while the snoop is out (a cache that answered first fetching it again, old data), and a
+// CPU line write granted in the second snoop of a copy not read again since the DMA wrote (an old copy written
+// over the DMA's data; a copy read in the second snoop has the new data, and its write-back is sound)
+wire  [22:0]  dq_line  = {d_dec[7:0], dpa[19:5]};
+wire  [22:0]  cpu_line = {ram_mb_at, a[19:5]};
+wire          pr_same  = dm_we & is_ram & c_line & cpu_line == dq_line;
+logic [3:0]   c_race = 4'd0, c_wb2 = 4'd0;
+logic         pr_fresh = 1'b0;
+always_ff @(posedge clk) begin
+	if (grant_cpu & pr_same & ~c_we & dq == DQ_SNOOP)  c_race <= c_race + 4'd1;
+	if (grant_cpu & pr_same &  c_we & dq == DQ_SNOOP2 & ~pr_fresh) c_wb2 <= c_wb2 + 4'd1;
+	if (dq != DQ_SNOOP2) pr_fresh <= 1'b0;
+	else if (grant_cpu & pr_same & ~c_we) pr_fresh <= 1'b1;
 end
 
 // ---- device accesses, a word at a time ----------------------------------------------------
@@ -795,6 +812,7 @@ logic [31:5] pcn_io_base;
 wire         pcn_hit = s_pciio && pcn_io_on && pcn_io_base == {2'b00, ia[29:5]};
 logic [31:0] pcn_cfg_q, pcn_q;
 logic        pcn_irq;
+logic [95:0]  pcn_dbg;
 `ifndef IBMRS6K7248_LITE
 IBMRS6K7248_pcnet pcnet (
 	.clk, .reset,
@@ -805,7 +823,7 @@ IBMRS6K7248_pcnet pcnet (
 	.dm_ack(pcn_dm_ack), .dm_err, .dm_rdata,
 	.clk_m(clk_v), .tx_pend(en_tx_pend), .tx_len(en_tx_len), .m_tx_a(en_tx_a), .m_tx_q(en_tx_q), .m_tx_done(en_tx_done),
 	.rx_free(en_rx_free), .m_rx_we(en_rx_we), .m_rx_a(en_rx_a), .m_rx_d(en_rx_d), .m_rx_post(en_rx_post),
-	.m_rx_len(en_rx_len), .m_rx_hash(en_rx_hash), .aprom_mac(en_aprom_mac), .padr(en_padr), .padr_ok(en_padr_ok)
+	.m_rx_len(en_rx_len), .m_rx_hash(en_rx_hash), .aprom_mac(en_aprom_mac), .padr(en_padr), .padr_ok(en_padr_ok), .dbg(pcn_dbg)
 );
 `else
 // (a LITE build, IBMRS6K7248_LITE, for quick debugging builds: no PCnet, device 12 absent)
@@ -813,7 +831,7 @@ assign pcn_io_on = 1'b0;           assign pcn_io_base = '0;
 assign pcn_cfg_q = 32'hFFFF_FFFF;  assign pcn_q = 32'hFFFF_FFFF;  assign pcn_irq = 1'b0;
 assign pcn_dm_req = 1'b0;  assign pcn_dm_we = 1'b0;  assign pcn_dm_addr = '0;  assign pcn_dm_be = '0;  assign pcn_dm_wdata = '0;
 assign en_tx_pend = 1'b0;  assign en_tx_len = '0;  assign en_tx_q = '0;  assign en_rx_free = 1'b0;
-assign en_padr = '0;       assign en_padr_ok = 1'b0;
+assign en_padr = '0;       assign en_padr_ok = 1'b0;     assign pcn_dbg = '0;
 `endif
 
 // ---- the ISA core: the 8259s, the 8254, the 8042, the RTC and NVRAM, port 92 -------------
@@ -859,13 +877,15 @@ logic [15:0] cs_l, cs_r, sb_l, sb_r;
 
 logic        irq0, irq1, irq8, irq12, nmi_mask;
 
+logic [63:0] pic_dbg;
 IBMRS6K7248_pic pic (
 	.clk, .reset,
 	.sel(d_go & (pic_hit | elcr_hit | (s_iack & ~d_we))), .we(d_we),
 	.slave(elcr_hit ? bport[0] : bport[7]), .a0(bport[0]), .elcr_sel(elcr_hit), .iack(s_iack),
 	.wdata(bwd), .rdata(pic_q),
-	.irq, .intr(ext_irq)
+	.irq, .intr(ext_irq), .dbg(pic_dbg)
 );
+assign en_dbg = {pic_dbg[63:40], c_race, c_wb2, pic_dbg[31:8], 3'(dq), dm_hold, s3_irq, ncr_irq, pcn_irq, ext_irq, pcn_dbg};
 
 IBMRS6K7248_pit #(.CLK_HZ(CPU_HZ)) pit (
 	.clk, .reset,

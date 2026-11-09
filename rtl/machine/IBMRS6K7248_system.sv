@@ -171,6 +171,7 @@ logic [10:0]  en_tx_len, en_tx_a, en_rx_a, en_rx_len;
 logic [7:0]   en_tx_q, en_rx_d;
 logic [5:0]   en_rx_hash;
 logic [47:0]  en_aprom_mac, en_padr;
+logic [159:0] en_dbg;
 logic         va_busy, va_dout_ready, va_rd, va_we;
 logic [7:0]   va_burstcnt, va_be;
 logic [28:0]  va_addr;
@@ -252,7 +253,7 @@ IBMRS6K7248_machine #(.CPU_HZ(CPU_HZ), .TB_HZ(TB_HZ), .LE_MODE(LE_MODE), .UART_F
 	.v_screen_on, .v_pix_mask, .v_pll_m, .v_pll_n, .v_cur_on, .v_cur_x, .v_cur_y, .v_cur_base, .v_cur_x11, .v_cur_fg, .v_cur_bg,
 	.pal_vaddr, .pal_vq, .v_txt, .font_vaddr, .font_vq, .vretrace_v, .disp_en_v,
 	.en_tx_pend, .en_tx_len, .en_tx_a, .en_tx_q, .en_tx_done, .en_rx_free, .en_rx_we, .en_rx_a, .en_rx_d,
-	.en_rx_post, .en_rx_len, .en_rx_hash, .en_aprom_mac, .en_padr, .en_padr_ok,
+	.en_rx_post, .en_rx_len, .en_rx_hash, .en_aprom_mac, .en_padr, .en_padr_ok, .en_dbg,
 	.com1_txd, .com1_rxd, .com1_cts_n, .com1_rts_n,
 	.io_ev, .io_we, .io_stub, .io_ncr, .io_addr, .io_be, .io_wdata, .io_rdata
 );
@@ -335,6 +336,7 @@ IBMRS6K7248_enetbox enetbox (
 	.tx_pend(en_tx_pend), .tx_len(en_tx_len), .m_tx_a(en_tx_a), .m_tx_q(en_tx_q), .m_tx_done(en_tx_done),
 	.rx_free(en_rx_free), .m_rx_we(en_rx_we), .m_rx_a(en_rx_a), .m_rx_d(en_rx_d), .m_rx_post(en_rx_post),
 	.m_rx_len(en_rx_len), .m_rx_hash(en_rx_hash), .aprom_mac(en_aprom_mac), .padr(en_padr), .padr_ok(en_padr_ok),
+	.dbg(en_dbg),
 	.nb_req, .nb_we, .nb_addr, .nb_wdata, .nb_ack, .nb_rdata
 );
 `else

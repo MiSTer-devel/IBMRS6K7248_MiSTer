@@ -41,7 +41,8 @@ module IBMRS6K7248_pic
 	output logic [7:0]  rdata,
 
 	input  logic [15:0] irq,           // the request lines (IRQ2 is the cascade: its input is ignored)
-	output logic        intr
+	output logic        intr,
+	output logic [63:0] dbg            // the slave's, then the master's IRR, ISR, IMR, ELCR (the network probe)
 );
 
 // the highest-priority bit of v, the priorities rotated so that line lowest is the lowest;
@@ -201,6 +202,8 @@ for (c = 0; c < 2; c++) begin : g_chip
 	end
 end
 endgenerate
+
+assign dbg = {irr[1], isr[1], imr[1], elcr[1], irr[0], isr[0], imr[0], elcr[0]};
 
 // ---- reads --------------------------------------------------------------------------
 always_ff @(posedge clk) begin

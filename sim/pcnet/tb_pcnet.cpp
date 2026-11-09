@@ -303,6 +303,68 @@ int main(int argc, char **argv) {
 	}
 	f0 = section("software style 0 (16-bit)", f0);
 
+	// 9. STOP, the rings rebuilt, STRT without INIT (what NT's amdpcn.sys does to recover): back to the first descriptors
+	{
+		csr_w(0, 0x0004);
+		bcr_w(20, 2);
+		for (int i = 0; i < 8; i++) { rx_desc2(i, 0x10000 + 0x800 * i, 1536, true); tx_desc2(i, 0x20000 + 0x800 * i, 0, 0); }
+		csr_w(1, (0x80000000 + IB) & 0xFFFF); csr_w(2, (0x80000000 + IB) >> 16);
+		csr_w(0, 0x0001);
+		expect("restart IDON", wait_csr0(0x0100), 1);
+		csr_w(0, 0x0142);
+		for (int i = 0; i < 3; i++) {                     // the chip three descriptors on, the transmitter one
+			wire_post(frame(MAC, 80, 20 + i), 0);
+			expect("restart RINT", wait_csr0(0x0400), 1);
+			csr_w(0, 0x0440);
+		}
+		auto g = frame(MAC, 60, 24);
+		memcpy(&mem[0x20000], g.data(), 60);
+		tx_desc2(0, 0x20000, 60, 0x8300);
+		csr_w(0, 0x0048);
+		wire_take();
+		run(500);
+		expect("restart RCVRC before", csr_r(72), 8 - 3);
+		csr_w(0, 0x0004);
+		for (int i = 0; i < 8; i++) { rx_desc2(i, 0x10000 + 0x800 * i, 1536, true); tx_desc2(i, 0x20000 + 0x800 * i, 0, 0); }
+		csr_w(0, 0x0042);
+		run(20);
+		expect("restart running", csr_r(0) & 0x0036, 0x0032);
+		auto f = frame(MAC, 80, 25);
+		wire_post(f, 0);
+		expect("restart RINT again", wait_csr0(0x0400), 1);
+		expect("restart RX in descriptor 0", r16(RDR + 6) & 0x8000, 0);
+		expect("restart descriptor 3 untouched", r16(RDR + 3 * 16 + 6) & 0x8000, 0x8000);
+		expect("restart RX bytes", memcmp(&mem[0x10000], f.data(), 80), 0);
+		csr_w(0, 0x0440);
+		memcpy(&mem[0x20000], g.data(), 60);
+		tx_desc2(0, 0x20000, 60, 0x8300);
+		csr_w(0, 0x0048);
+		expect("restart TX from descriptor 0", wire_take() == g, 1);
+		run(500);
+		csr_w(0, 0x0240);
+
+		// a frame in flight when STOP comes: dropped, its descriptor left alone, nothing moved on
+		memset(&mem[0x10800], 0, 0x800);
+		auto l = frame(MAC, 1400, 26);
+		wire_post(l, 0);
+		int n = 0;
+		while (mem[0x10800] != l[0] && n++ < 100000) tick();
+		expect("in flight", mem[0x10800], l[0]);
+		csr_w(0, 0x0004);
+		run(20000);
+		expect("in flight descriptor keeps OWN", r16(RDR + 16 + 6) & 0x8000, 0x8000);
+		expect("in flight no RINT", csr_r(0) & 0x0400, 0);
+		for (int i = 0; i < 8; i++) rx_desc2(i, 0x10000 + 0x800 * i, 1536, true);
+		csr_w(0, 0x0042);
+		run(20);
+		f = frame(MAC, 80, 27);
+		wire_post(f, 0);
+		expect("after in flight RINT", wait_csr0(0x0400), 1);
+		expect("after in flight: descriptor 0", r16(RDR + 6) & 0x8000, 0);
+		expect("after in flight: descriptor 1 waits", r16(RDR + 16 + 6) & 0x8000, 0x8000);
+	}
+	f0 = section("STOP and STRT without INIT: the rings restart", f0);
+
 	printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
 	delete t;
 	return fails ? 1 : 0;

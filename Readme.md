@@ -11,7 +11,7 @@ firmware and can also act as its sibling, the IBM Power Series 850.
 | AIX 5.1 | install from volume 1, boot from disk, CDE |
 | Solaris 2.5.1 (PowerPC) | install, boot from disk, CDE; CDE developer kit, ODBC and Wabi from the Desktop 1.1 CD |
 | OS/2 Warp (PowerPC Edition) | install, boot from disk, desktop (as a Power Series 850) |
-| Windows NT 4.0 (PowerPC) | install, boot from disk, desktop, CD audio |
+| Windows NT 4.0 (PowerPC) | install, boot from disk, desktop, CD audio, networking |
 
 ## Downloads
 

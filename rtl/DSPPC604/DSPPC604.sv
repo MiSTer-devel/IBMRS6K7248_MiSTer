@@ -3122,11 +3122,20 @@ DSPPC604_cache #(.WRITABLE (1), .LATE_ANSWER (0), .IDXW (DC_IDXW)) dcache
 // the memory port: data before instructions, a request once started keeps it
 logic mem_owner_i;      // the instruction cache's request is on the port
 logic mem_busy;
+// A cache that has answered an external snoop starts nothing on the snooped
+// line until the snoop is over: the memory behind it is about to change, and
+// a line read now (the other cache still answering) would be the old one,
+// which a store then dirties and writes back over the new data. The other
+// cache never needs that line to answer, so the wait ends.
+wire dm_hold = snoop_req & dc_snoop_done & (dm_addr[31:5] == snoop_addr);
+wire im_hold = snoop_req & ic_snoop_done & (im_addr[31:5] == snoop_addr);
+wire dm_go   = dm_req & ~dm_hold;
+wire im_go   = im_req & ~im_hold;
 always_ff @(posedge clk) begin
 	if (mem_ack) mem_busy <= 1'b0;
-	else if (~mem_busy & (dm_req | im_req)) begin
+	else if (~mem_busy & (dm_go | im_go)) begin
 		mem_busy    <= 1'b1;
-		mem_owner_i <= ~dm_req;
+		mem_owner_i <= ~dm_go;
 	end
 	if (reset) mem_busy <= 1'b0;
 end
@@ -3136,8 +3145,8 @@ end
 // owner selected then does not matter: the select is from registers, and
 // the machine's answer is not in front of the port's address and the
 // memory map behind it; only the request waits for it.
-wire sel_i = mem_busy ? mem_owner_i : ~dm_req;
-assign mem_req   = (mem_busy | ~mem_ack) & (sel_i ? im_req : dm_req);
+wire sel_i = mem_busy ? mem_owner_i : ~dm_go;
+assign mem_req   = (mem_busy | ~mem_ack) & (mem_busy ? (sel_i ? im_req : dm_req) : (sel_i ? im_go : dm_go));
 assign mem_we    = sel_i ? im_we    : dm_we;
 assign mem_line  = sel_i ? im_line  : dm_line;
 assign mem_addr  = sel_i ? im_addr  : dm_addr;

@@ -19,6 +19,8 @@
 //                   driver's address, for the Main's filter)
 //    +0038 PROM MAC the Main's: bit 63 valid, the MAC for the address PROM
 //                   (this core's addition; else DEF_MAC)
+//    +0040 PROBE    ours, only with IBMRS6K7248_NETPROBE: 3 words of the
+//                   PCnet's, the PIC's and the DMA's state, 20 times a second
 //    +1000 TX ring  8 slots of 800: word 0 bits 10:0 the length, then the
 //                   frame, byte i in lane i mod 8 of word 1 + i / 8; no FCS
 //    +5000 RX ring  16 slots of 800: word 0 bits 10:0 the length with the
@@ -65,6 +67,7 @@ module IBMRS6K7248_enetbox
 	output logic [47:0] aprom_mac,
 	input  logic [47:0] padr,
 	input  logic        padr_ok,
+	input  logic [159:0] dbg,                                // the probe's words (another clock, read as they stand)
 
 	// the mailbox port: one 64-bit word, held until nb_ack
 	output logic        nb_req,
@@ -122,6 +125,14 @@ logic [31:0] poll_tmr, pmac_tmr;
 logic [14:0] pace;                           // bit times until the frame may be posted
 wire  [12:0] rslot = NB_RX + {1'b0, rxr[3:0], 8'd0};
 
+// the network probe
+`ifdef IBMRS6K7248_NETPROBE
+localparam logic [12:0] NB_DBG = 13'h0008;
+logic [1:0]  dk = 2'd0;
+logic [31:0] dbg_tmr = 32'd0;
+wire  [63:0] dbg_w = dk == 2'd0 ? dbg[63:0] : dk == 2'd1 ? dbg[159:96] : {tick, dbg[95:64]};
+`endif
+
 // MAC
 logic        mac_pend, padr_ok_q;
 logic [47:0] padr_q;
@@ -160,6 +171,9 @@ always_ff @(posedge clk) begin
 		if (poll_tmr != 32'd0) poll_tmr <= poll_tmr - 32'd1;
 		if (pmac_tmr != 32'd0) pmac_tmr <= pmac_tmr - 32'd1;
 		if (txr_tmr != 32'd0) txr_tmr <= txr_tmr - 32'd1;
+`ifdef IBMRS6K7248_NETPROBE
+		if (dbg_tmr != 32'd0) dbg_tmr <= dbg_tmr - 32'd1;
+`endif
 		if (tx_pend && !tx_busy && !tx_room && tx_wait != TXWAIT) tx_wait <= tx_wait + 32'd1;
 		if (bit_tick && pace != 15'd0) pace <= pace - 15'd1;
 
@@ -239,6 +253,13 @@ always_ff @(posedge clk) begin
 					pmac_tmr <= MACPOLL;
 					nb(NB_PMAC, 1'b0, 64'd0, S_PMAC);
 				end
+`ifdef IBMRS6K7248_NETPROBE
+				else if (dbg_tmr == 32'd0) begin
+					dk <= dk == 2'd2 ? 2'd0 : dk + 2'd1;
+					if (dk == 2'd2) dbg_tmr <= CLK_HZ / 20;
+					nb(NB_DBG + 13'(dk), 1'b1, dbg_w, S_IDLE);
+				end
+`endif
 
 			// ---- TX: the frame into the slot's words, little-endian (bytes shifted in from the top)
 			S_TXA: st <= S_TXB;                              // (m_tx_q <- the byte at tp)
